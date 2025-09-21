@@ -63,6 +63,11 @@ def pair_wise_score(pred_imgs, gt_imgs, metric, is_sucess):
     assert len(pred_imgs) == len(gt_imgs)
     assert np.min(pred_imgs) >= 0 and np.min(gt_imgs) >= 0
     assert isinstance(metric, fid_wrapper) == False, 'FID not supported'
+
+    if len(pred_imgs) < 2:
+        # Cannot do pair-wise comparison with less than 2 samples
+        return [0.0] * len(pred_imgs)
+
     corrects = []
     for idx, pred in enumerate(pred_imgs):
         gt = gt_imgs[idx]
@@ -82,9 +87,13 @@ def n_way_scores(pred_imgs, gt_imgs, metric, is_sucess, n=2, n_trials=100):
     # all in pixel values: 0 ~ 255
     # return: list of scores 0 ~ 1.
     assert len(pred_imgs) == len(gt_imgs)
-    assert n <= len(pred_imgs) and n >= 2
     assert np.min(pred_imgs) >= 0 and np.min(gt_imgs) >= 0
     assert isinstance(metric, fid_wrapper) == False, 'FID not supported'
+
+    if len(pred_imgs) < n:
+        # Cannot do n-way comparison with less than n samples
+        return [0.0] * len(pred_imgs)
+
     corrects = []
     for idx, pred in enumerate(pred_imgs):
         gt = gt_imgs[idx]
@@ -116,8 +125,8 @@ def n_way_top_k_acc(pred, class_id, n_way, num_trials=40, top_k=1):
     for t in range(num_trials):
         idxs_picked = np.random.choice(pick_range, n_way-1, replace=False)
         pred_picked = torch.cat([pred[class_id].unsqueeze(0), pred[idxs_picked]])
-        acc = accuracy(pred_picked.unsqueeze(0), torch.tensor([0], device=pred.device), 
-                    top_k=top_k)
+        acc = accuracy(pred_picked.unsqueeze(0), torch.tensor([0], device=pred.device),
+                    task='multiclass', num_classes=pred_picked.shape[0], top_k=top_k)
         acc_list.append(acc.item())
     return np.mean(acc_list), np.std(acc_list)
 

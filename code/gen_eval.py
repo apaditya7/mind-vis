@@ -37,10 +37,10 @@ def wandb_init(config):
                 config=config,
                 reinit=True)
 
-def get_eval_metric(samples, avg=True):
+def get_eval_metric(samples, avg=True, device='cpu'):
     metric_list = ['mse', 'pcc', 'ssim', 'psm']
     res_list = []
-    
+
     gt_images = [img[0] for img in samples]
     gt_images = rearrange(np.stack(gt_images), 'n c h w -> n h w c')
     samples_to_run = np.arange(1, len(samples[0])) if avg else [1]
@@ -51,13 +51,23 @@ def get_eval_metric(samples, avg=True):
             pred_images = rearrange(np.stack(pred_images), 'n c h w -> n h w c')
             res = get_similarity_metric(pred_images, gt_images, method='pair-wise', metric_name=m)
             res_part.append(np.mean(res))
-        res_list.append(np.mean(res_part))     
+        res_list.append(np.mean(res_part))
+
+    fid_res = []
+    for s in samples_to_run:
+        pred_images = [img[s] for img in samples]
+        pred_images = rearrange(np.stack(pred_images), 'n c h w -> n h w c')
+        fid_score = get_similarity_metric(pred_images, gt_images, method='metrics-only', metric_name='fid')
+        fid_res.append(fid_score)
+    res_list.append(np.mean(fid_res))
+    metric_list.append('fid')
+
     res_part = []
     for s in samples_to_run:
         pred_images = [img[s] for img in samples]
         pred_images = rearrange(np.stack(pred_images), 'n c h w -> n h w c')
-        res = get_similarity_metric(pred_images, gt_images, 'class', None, 
-                        n_way=50, num_trials=1000, top_k=1, device='cuda')
+        res = get_similarity_metric(pred_images, gt_images, 'class', None,
+                        n_way=50, num_trials=1000, top_k=1, device=device)
         res_part.append(np.mean(res))
     res_list.append(np.mean(res_part))
     res_list.append(np.max(res_part))
@@ -70,6 +80,7 @@ def get_args_parser():
     # project parameters
     parser.add_argument('--root', type=str, default='.')
     parser.add_argument('--dataset', type=str, default='GOD')
+    parser.add_argument('--max_samples', type=int, default=None, help='Limit number of samples to process')
 
     return parser
 
@@ -81,7 +92,7 @@ if __name__ == '__main__':
     target = args.dataset
     model_path = os.path.join(root, 'pretrains', f'{target}', 'finetuned.pth')
   
-    sd = torch.load(model_path, map_location='cpu')
+    sd = torch.load(model_path, map_location='cpu', weights_only=False)
     config = sd['config']
     # update paths
     config.root_path = root
@@ -113,9 +124,15 @@ if __name__ == '__main__':
         raise NotImplementedError
  
     num_voxels = dataset_test.num_voxels
-    print(len(dataset_test))
-    # prepare pretrained mae 
-    pretrain_mbm_metafile = torch.load(config.pretrain_mbm_path, map_location='cpu')
+    total_samples = len(dataset_test)
+    if args.max_samples:
+        total_samples = min(total_samples, args.max_samples)
+        print(f"Processing limited to {total_samples} samples")
+    
+    print(f"Total samples to process: {total_samples}")
+    
+
+    pretrain_mbm_metafile = torch.load(config.pretrain_mbm_path, map_location='cpu', weights_only=False)
     # create generateive model
     generative_model = fLDM(pretrain_mbm_metafile, num_voxels,
                 device=device, pretrain_root=config.pretrain_gm_path, logger=config.logger,
@@ -123,8 +140,10 @@ if __name__ == '__main__':
     generative_model.model.load_state_dict(sd['model_state_dict'])
     print('load ldm successfully')
     state = sd['state']
+    
+    # Use the original generate method but with limit parameter
     grid, samples = generative_model.generate(dataset_test, config.num_samples, 
-                config.ddim_steps, config.HW, limit=None, state=state) # generate 10 instances
+                config.ddim_steps, config.HW, limit=total_samples, state=state)
     grid_imgs = Image.fromarray(grid.astype(np.uint8))
 
     os.makedirs(output_path, exist_ok=True)
@@ -132,10 +151,11 @@ if __name__ == '__main__':
 
     wandb_init(config)
     wandb.log({f'summary/samples_test': wandb.Image(grid_imgs)})
-    metric, metric_list = get_eval_metric(samples, avg=True)
+    metric, metric_list = get_eval_metric(samples, avg=True, device=device)
     metric_dict = {f'summary/pair-wise_{k}':v for k, v in zip(metric_list[:-2], metric[:-2])}
     metric_dict[f'summary/{metric_list[-2]}'] = metric[-2]
     metric_dict[f'summary/{metric_list[-1]}'] = metric[-1]
     print(metric_dict)
     wandb.log(metric_dict)
     
+    print(f"Results saved to: {output_path}")
