@@ -81,6 +81,10 @@ def get_args_parser():
     parser.add_argument('--root', type=str, default='.')
     parser.add_argument('--dataset', type=str, default='GOD')
     parser.add_argument('--max_samples', type=int, default=None, help='Limit number of samples to process')
+    # shape conditioning parameters
+    parser.add_argument('--use_shape_conditioning', action='store_true', help='Enable shape conditioning')
+    parser.add_argument('--shape_predictor_path', type=str, default=None,
+                       help='Path to trained shape predictor model')
 
     return parser
 
@@ -88,6 +92,14 @@ def get_args_parser():
 if __name__ == '__main__':
     args = get_args_parser()
     args = args.parse_args()
+
+    # Validate shape conditioning arguments
+    if args.use_shape_conditioning and not args.shape_predictor_path:
+        raise ValueError("--shape_predictor_path must be provided when --use_shape_conditioning is enabled")
+
+    if args.use_shape_conditioning and not os.path.exists(args.shape_predictor_path):
+        raise FileNotFoundError(f"Shape predictor not found: {args.shape_predictor_path}")
+
     root = args.root
     target = args.dataset
     model_path = os.path.join(root, 'pretrains', f'{target}', 'finetuned.pth')
@@ -136,8 +148,10 @@ if __name__ == '__main__':
     # create generateive model
     generative_model = fLDM(pretrain_mbm_metafile, num_voxels,
                 device=device, pretrain_root=config.pretrain_gm_path, logger=config.logger,
-                ddim_steps=config.ddim_steps, global_pool=config.global_pool, use_time_cond=config.use_time_cond)
-    generative_model.model.load_state_dict(sd['model_state_dict'])
+                ddim_steps=config.ddim_steps, global_pool=config.global_pool, use_time_cond=config.use_time_cond,
+                use_shape_conditioning=args.use_shape_conditioning,
+                shape_predictor_path=args.shape_predictor_path)
+    generative_model.model.load_state_dict(sd['model_state_dict'], strict=False)
     print('load ldm successfully')
     state = sd['state']
     

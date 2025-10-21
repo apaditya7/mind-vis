@@ -14,13 +14,14 @@ from sc_mbm.mae_for_fmri import fmri_encoder
 
 def create_model_from_config(config, num_voxels, global_pool):
     model = fmri_encoder(num_voxels=num_voxels, patch_size=config.patch_size, embed_dim=config.embed_dim,
-                depth=config.depth, num_heads=config.num_heads, mlp_ratio=config.mlp_ratio, global_pool=global_pool) 
+                depth=config.depth, num_heads=config.num_heads, mlp_ratio=config.mlp_ratio, global_pool=global_pool)
     return model
 
 class cond_stage_model(nn.Module):
-    def __init__(self, metafile, num_voxels, cond_dim=1280, global_pool=True):
+    def __init__(self, metafile, num_voxels, cond_dim=1280, global_pool=True,
+                 use_shape_conditioning=False, shape_predictor_path=None):
         super().__init__()
-        # prepare pretrained fmri mae 
+        # prepare pretrained fmri mae (no shape head needed)
         model = create_model_from_config(metafile['config'], num_voxels, global_pool)
         model.load_checkpoint(metafile['model'])
         self.mae = model
@@ -33,35 +34,78 @@ class cond_stage_model(nn.Module):
             )
         self.dim_mapper = nn.Linear(self.fmri_latent_dim, cond_dim, bias=True)
         self.global_pool = global_pool
+        self.use_shape_conditioning = use_shape_conditioning
+
+        # External shape predictor
+        self.shape_predictor = None
+        if use_shape_conditioning and shape_predictor_path:
+            from shape_predictor import ShapePredictor
+            checkpoint = torch.load(shape_predictor_path, map_location='cpu')
+            self.shape_predictor = ShapePredictor(
+                fmri_dim=checkpoint['fmri_dim'],
+                shape_dim=checkpoint['shape_dim']
+            )
+            self.shape_predictor.load_state_dict(checkpoint['model_state_dict'])
+            self.shape_predictor.eval()
+
+            # Map shape predictions to same dimension as semantic conditioning
+            self.shape_mapper = nn.Linear(checkpoint['shape_dim'], cond_dim, bias=True)
+            self.shape_weight = 0.05  # Weight for blending shape with semantic
 
     def forward(self, x):
         # n, c, w = x.shape
+        # Get semantic embedding from fMRI encoder
         latent_crossattn = self.mae(x)
         if self.global_pool == False:
             latent_crossattn = self.channel_mapper(latent_crossattn)
         latent_crossattn = self.dim_mapper(latent_crossattn)
-        out = latent_crossattn
-        return out
+
+        if self.use_shape_conditioning and self.shape_predictor is not None:
+            # Get shape prediction from external shape predictor
+            fmri_flattened = x.flatten(1)  # Flatten fMRI for shape predictor
+            with torch.no_grad():  # Don't train shape predictor during diffusion training
+                shape_pred = self.shape_predictor(fmri_flattened)
+
+            # Map shape to conditioning space (same dim as semantic)
+            shape_cond = self.shape_mapper(shape_pred)
+
+            # Reshape shape conditioning to match semantic conditioning
+            if self.global_pool:
+                shape_cond = shape_cond.unsqueeze(1)  # (batch, 1, cond_dim)
+            else:
+                shape_cond = shape_cond.unsqueeze(1).expand(-1, latent_crossattn.size(1), -1)
+
+            # Blend semantic and shape conditioning (don't concatenate)
+            out = latent_crossattn + self.shape_weight * shape_cond
+            return out
+        else:
+            return latent_crossattn
 
 class fLDM:
 
     def __init__(self, metafile, num_voxels, device=torch.device('cpu'),
                  pretrain_root='../pretrains/ldm/label2img',
-                 logger=None, ddim_steps=250, global_pool=True, use_time_cond=True):
+                 logger=None, ddim_steps=250, global_pool=True, use_time_cond=True,
+                 use_shape_conditioning=False, shape_predictor_path=None):
         self.ckp_path = os.path.join(pretrain_root, 'model.ckpt')
-        self.config_path = os.path.join(pretrain_root, 'config.yaml') 
+        self.config_path = os.path.join(pretrain_root, 'config.yaml')
         config = OmegaConf.load(self.config_path)
         config.model.params.unet_config.params.use_time_cond = use_time_cond
         config.model.params.unet_config.params.global_pool = global_pool
 
         self.cond_dim = config.model.params.unet_config.params.context_dim
+        self.use_shape_conditioning = use_shape_conditioning
+
+        # Keep original context dimension - don't change U-Net architecture
 
         model = instantiate_from_config(config.model)
         pl_sd = torch.load(self.ckp_path, map_location="cpu")['state_dict']
-       
+
         m, u = model.load_state_dict(pl_sd, strict=False)
         model.cond_stage_trainable = True
-        model.cond_stage_model = cond_stage_model(metafile, num_voxels, self.cond_dim, global_pool=global_pool)
+        model.cond_stage_model = cond_stage_model(metafile, num_voxels, self.cond_dim, global_pool=global_pool,
+                                                 use_shape_conditioning=use_shape_conditioning,
+                                                 shape_predictor_path=shape_predictor_path)
 
         model.ddim_steps = ddim_steps
         model.re_init_ema()

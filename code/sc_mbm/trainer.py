@@ -1,9 +1,11 @@
 import math, sys
 import torch
 import sc_mbm.utils as ut
-from torch._six import inf
 import numpy as np
 import time
+
+# torch._six was removed in PyTorch 2.5, use math.inf instead
+inf = float('inf')
 
 class NativeScalerWithGradNormCount:
     state_dict_key = "amp_scaler"

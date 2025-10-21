@@ -5,11 +5,16 @@ from torch.utils.data import DataLoader
 from torch.nn.parallel import DistributedDataParallel
 import argparse
 import time
-import timm.optim.optim_factory as optim_factory
 import datetime
 import matplotlib.pyplot as plt
 import wandb
 import copy
+
+# Compatibility: timm changed API in newer versions
+try:
+    import timm.optim.optim_factory as optim_factory
+except ImportError:
+    optim_factory = None
 
 from config import Config_MBM_fMRI
 from dataset import hcp_dataset
@@ -20,6 +25,7 @@ from sc_mbm.utils import save_model
 
 os.environ["WANDB_START_METHOD"] = "thread"
 os.environ['WANDB_DIR'] = "."
+os.environ['WANDB_MODE'] = 'offline'  # Disable wandb for non-interactive runs
 
 class wandb_logger:
     def __init__(self, config):
@@ -142,8 +148,13 @@ def main(config):
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
         model = DistributedDataParallel(model, device_ids=[config.local_rank], output_device=config.local_rank, find_unused_parameters=config.use_nature_img_loss)
 
-    param_groups = optim_factory.add_weight_decay(model, config.weight_decay)
-    optimizer = torch.optim.AdamW(param_groups, lr=config.lr, betas=(0.9, 0.95))
+    # Create optimizer with weight decay (compatible with newer timm versions)
+    if optim_factory is not None and hasattr(optim_factory, 'add_weight_decay'):
+        param_groups = optim_factory.add_weight_decay(model, config.weight_decay)
+        optimizer = torch.optim.AdamW(param_groups, lr=config.lr, betas=(0.9, 0.95))
+    else:
+        # Fallback for newer timm versions
+        optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay, betas=(0.9, 0.95))
     print(optimizer)
     loss_scaler = NativeScaler()
 

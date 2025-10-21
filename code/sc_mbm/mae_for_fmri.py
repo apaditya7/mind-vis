@@ -311,7 +311,8 @@ class MAEforFMRI(nn.Module):
 
 class fmri_encoder(nn.Module):
     def __init__(self, num_voxels=224, patch_size=16, embed_dim=1024, in_chans=1,
-                 depth=24, num_heads=16, mlp_ratio=4., norm_layer=nn.LayerNorm, global_pool=True):
+                 depth=24, num_heads=16, mlp_ratio=4., norm_layer=nn.LayerNorm, global_pool=True,
+                 use_shape_head=False, shape_dim=256):
         super().__init__()
         self.patch_embed = PatchEmbed1D(num_voxels, patch_size, in_chans, embed_dim)
 
@@ -323,13 +324,24 @@ class fmri_encoder(nn.Module):
             Block(embed_dim, num_heads, mlp_ratio, qkv_bias=True, norm_layer=norm_layer)
             for i in range(depth)])
         self.norm = norm_layer(embed_dim)
-    
+
         self.mask_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         self.embed_dim = embed_dim
 
         self.patch_size = patch_size
         self.num_patches = num_patches
         self.global_pool = global_pool
+        self.use_shape_head = use_shape_head
+
+        # Shape decoder head - predicts edge/shape maps
+        if self.use_shape_head:
+            self.shape_head = nn.Sequential(
+                nn.Linear(embed_dim, embed_dim // 2),
+                nn.ReLU(),
+                nn.Linear(embed_dim // 2, shape_dim),
+                nn.Sigmoid()  # Output shape probabilities
+            )
+
         self.initialize_weights()
 
     def initialize_weights(self):
@@ -374,12 +386,21 @@ class fmri_encoder(nn.Module):
             x = x.mean(dim=1, keepdim=True)
         x = self.norm(x)
 
-        return x  
+        # Predict shape if shape head is enabled
+        shape_pred = None
+        if self.use_shape_head:
+            # Use global pooled representation for shape prediction
+            pooled_x = x.mean(dim=1) if not self.global_pool else x.squeeze(1)
+            shape_pred = self.shape_head(pooled_x)
+
+        return x, shape_pred  
 
     def forward(self, imgs):
         if imgs.ndim == 2:
             imgs = torch.unsqueeze(imgs, dim=0)  # N, n_seq, embed_dim
-        latent = self.forward_encoder(imgs) # N, n_seq, embed_dim
+        latent, shape_pred = self.forward_encoder(imgs) # N, n_seq, embed_dim
+        if self.use_shape_head:
+            return latent, shape_pred
         return latent # N, n_seq, embed_dim
     
     def load_checkpoint(self, state_dict):
