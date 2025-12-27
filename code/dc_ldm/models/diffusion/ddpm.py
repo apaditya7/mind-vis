@@ -112,9 +112,11 @@ class DDPM(pl.LightningModule):
         self.loss_type = loss_type
 
         self.learn_logvar = learn_logvar
-        self.logvar = torch.full(fill_value=logvar_init, size=(self.num_timesteps,))
+        logvar = torch.full(fill_value=logvar_init, size=(self.num_timesteps,))
         if self.learn_logvar:
-            self.logvar = nn.Parameter(self.logvar, requires_grad=True)
+            self.logvar = nn.Parameter(logvar, requires_grad=True)
+        else:
+            self.register_buffer('logvar', logvar)
 
         self.validation_count = 0
         self.ddim_steps = ddim_steps
@@ -416,7 +418,11 @@ class DDPM(pl.LightningModule):
                 x_samples_ddim = model.decode_first_stage(samples_ddim)
                 x_samples_ddim = torch.clamp((x_samples_ddim+1.0)/2.0,min=0.0, max=1.0)
                 gt_image = torch.clamp((gt_image+1.0)/2.0,min=0.0, max=1.0)
-                
+
+                # Resize gt_image to match x_samples_ddim size
+                if gt_image.shape != x_samples_ddim[0:1].shape:
+                    gt_image = F.interpolate(gt_image, size=x_samples_ddim.shape[-2:], mode='bilinear', align_corners=False)
+
                 all_samples.append(torch.cat([gt_image.detach().cpu(), x_samples_ddim.detach().cpu()], dim=0)) # put groundtruth at first
         
         # display as grid
@@ -444,8 +450,6 @@ class DDPM(pl.LightningModule):
         self.save_images(all_samples, suffix='%.4f'%metric[-1])
         metric_dict = {f'val/{k}_full':v for k, v in zip(metric_list, metric)}
         self.logger.log_metrics(metric_dict)
-        grid_imgs = Image.fromarray(grid.astype(np.uint8))
-        self.logger.log_image(key=f'samples_test_full', images=[grid_imgs])
         if metric[-1] > self.best_val:
             self.best_val = metric[-1]
             torch.save(
@@ -462,19 +466,26 @@ class DDPM(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         if batch_idx != 0:
             return
-        
+
+        # Compute validation loss for monitoring by ModelCheckpoint
+        loss, loss_dict = self.shared_step(batch)
+        # Log validation metrics using self.log for PyTorch Lightning aggregation
+        self.log('val/loss', loss_dict['val/loss'], prog_bar=True, logger=True, on_step=False, on_epoch=True)
+        self.log('val/loss_simple', loss_dict['val/loss_simple'], logger=True, on_step=False, on_epoch=True)
+        self.log('val/loss_vlb', loss_dict['val/loss_vlb'], logger=True, on_step=False, on_epoch=True)
+
         if self.validation_count % 15 == 0 and self.trainer.current_epoch != 0:
             self.full_validation(batch)
         else:
             grid, all_samples, state = self.generate(batch, ddim_steps=self.ddim_steps, num_samples=3, limit=5)
             metric, metric_list = self.get_eval_metric(all_samples, avg=self.eval_avg)
-            grid_imgs = Image.fromarray(grid.astype(np.uint8))
-            self.logger.log_image(key=f'samples_test', images=[grid_imgs])
             metric_dict = {f'val/{k}':v for k, v in zip(metric_list, metric)}
             self.logger.log_metrics(metric_dict)
             if metric[-1] > self.run_full_validation_threshold:
                 self.full_validation(batch, state=state)
         self.validation_count += 1
+
+        return loss
 
     def get_eval_metric(self, samples, avg=True):
         metric_list = ['mse', 'pcc', 'ssim', 'psm']
@@ -1084,7 +1095,7 @@ class LatentDiffusion(DDPM):
         loss_simple = self.get_loss(model_output, target, mean=False).mean([1, 2, 3])
         loss_dict.update({f'{prefix}/loss_simple': loss_simple.mean()})
 
-        logvar_t = self.logvar[t].to(self.device)
+        logvar_t = self.logvar[t]
         loss = loss_simple / torch.exp(logvar_t) + logvar_t
         # loss = loss_simple / torch.exp(self.logvar) + self.logvar
         if self.learn_logvar:

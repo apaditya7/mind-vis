@@ -159,11 +159,11 @@ class fLDM:
         
 
     @torch.no_grad()
-    def generate(self, fmri_embedding, num_samples, ddim_steps, HW=None, limit=None, state=None):
+    def generate(self, fmri_embedding, num_samples, ddim_steps, HW=None, limit=None, state=None, guidance_scale=5.0):
         # fmri_embedding: n, seq_len, embed_dim
         all_samples = []
         if HW is None:
-            shape = (self.ldm_config.model.params.channels, 
+            shape = (self.ldm_config.model.params.channels,
                 self.ldm_config.model.params.image_size, self.ldm_config.model.params.image_size)
         else:
             num_resolutions = len(self.ldm_config.model.params.first_stage_config.params.ddconfig.ch_mult)
@@ -174,8 +174,11 @@ class fLDM:
         sampler = PLMSSampler(model)
         # sampler = DDIMSampler(model)
         if state is not None:
-            torch.cuda.set_rng_state(state)
-            
+            try:
+                torch.cuda.set_rng_state(state)
+            except (RuntimeError, ValueError) as e:
+                print(f"Warning: Could not restore RNG state: {e}. Using fresh random state.")
+
         with model.ema_scope():
             model.eval()
             for count, item in enumerate(fmri_embedding):
@@ -184,23 +187,35 @@ class fLDM:
                         break
                 latent = item['fmri']
                 gt_image = rearrange(item['image'], 'h w c -> 1 c h w') # h w c
-                print(f"rendering {num_samples} examples in {ddim_steps} steps.")
+                print(f"rendering {num_samples} examples in {ddim_steps} steps (guidance_scale={guidance_scale}).")
                 # assert latent.shape[-1] == self.fmri_latent_dim, 'dim error'
-                
+
                 c = model.get_learned_conditioning(repeat(latent, 'h w -> c h w', c=num_samples).to(self.device))
-                samples_ddim, _ = sampler.sample(S=ddim_steps, 
-                                                conditioning=c,
-                                                batch_size=num_samples,
-                                                shape=shape,
-                                                verbose=False)
+
+                # Classifier-free guidance: use unconditional embeddings when guidance_scale > 1.0
+                if guidance_scale > 1.0:
+                    uc = torch.zeros_like(c)
+                    samples_ddim, _ = sampler.sample(S=ddim_steps,
+                                                    conditioning=c,
+                                                    batch_size=num_samples,
+                                                    shape=shape,
+                                                    verbose=False,
+                                                    unconditional_guidance_scale=guidance_scale,
+                                                    unconditional_conditioning=uc)
+                else:
+                    samples_ddim, _ = sampler.sample(S=ddim_steps,
+                                                    conditioning=c,
+                                                    batch_size=num_samples,
+                                                    shape=shape,
+                                                    verbose=False)
 
                 x_samples_ddim = model.decode_first_stage(samples_ddim)
                 x_samples_ddim = torch.clamp((x_samples_ddim+1.0)/2.0, min=0.0, max=1.0)
                 gt_image = torch.clamp((gt_image+1.0)/2.0, min=0.0, max=1.0)
-                
+
                 all_samples.append(torch.cat([gt_image, x_samples_ddim.detach().cpu()], dim=0)) # put groundtruth at first
-                
-        
+
+
         # display as grid
         grid = torch.stack(all_samples, 0)
         grid = rearrange(grid, 'n b c h w -> (n b) c h w')
@@ -209,7 +224,7 @@ class fLDM:
         # to image
         grid = 255. * rearrange(grid, 'c h w -> h w c').cpu().numpy()
         model = model.to('cpu')
-        
+
         return grid, (255. * torch.stack(all_samples, 0).cpu().numpy()).astype(np.uint8)
 
 

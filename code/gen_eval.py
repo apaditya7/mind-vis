@@ -31,11 +31,19 @@ def normalize(img):
     return img
 
 def wandb_init(config):
-    wandb.init( project="mind-vis",
-                group='eval',
-                anonymous="allow",
-                config=config,
-                reinit=True)
+    # Skip wandb if disabled (e.g., on cluster without login)
+    if os.getenv('WANDB_MODE') == 'disabled':
+        return None
+    try:
+        wandb.init( project="mind-vis",
+                    group='eval',
+                    anonymous="allow",
+                    config=config,
+                    reinit=True)
+    except Exception as e:
+        print(f"Warning: WandB initialization failed: {e}")
+        print("Continuing without WandB logging...")
+        return None
 
 def get_eval_metric(samples, avg=True, device='cpu'):
     metric_list = ['mse', 'pcc', 'ssim', 'psm']
@@ -163,13 +171,36 @@ if __name__ == '__main__':
     os.makedirs(output_path, exist_ok=True)
     grid_imgs.save(os.path.join(output_path,f'./samples_test.png'))
 
-    wandb_init(config)
-    wandb.log({f'summary/samples_test': wandb.Image(grid_imgs)})
+    # Compute metrics
+    print("\n" + "="*60)
+    print("COMPUTING EVALUATION METRICS")
+    print("="*60)
     metric, metric_list = get_eval_metric(samples, avg=True, device=device)
     metric_dict = {f'summary/pair-wise_{k}':v for k, v in zip(metric_list[:-2], metric[:-2])}
     metric_dict[f'summary/{metric_list[-2]}'] = metric[-2]
     metric_dict[f'summary/{metric_list[-1]}'] = metric[-1]
-    print(metric_dict)
-    wandb.log(metric_dict)
-    
-    print(f"Results saved to: {output_path}")
+
+    # Print metrics prominently
+    print("\n" + "="*60)
+    print("EVALUATION RESULTS")
+    print("="*60)
+    for key, value in metric_dict.items():
+        metric_name = key.replace('summary/', '').replace('pair-wise_', '')
+        if 'fid' in metric_name.lower():
+            print(f"{metric_name:20s}: {value:.2f} (lower is better)")
+        elif 'class' in metric_name.lower():
+            print(f"{metric_name:20s}: {value*100:.2f}% (higher is better)")
+        else:
+            print(f"{metric_name:20s}: {value:.4f} (higher is better)")
+    print("="*60 + "\n")
+
+    # Try W&B logging (optional, may fail on cluster)
+    try:
+        wandb_init(config)
+        wandb.log({f'summary/samples_test': wandb.Image(grid_imgs)})
+        wandb.log(metric_dict)
+        print("✓ Logged to W&B successfully")
+    except Exception as e:
+        print(f"⚠ W&B logging failed (this is OK): {e}")
+
+    print(f"\nResults saved to: {output_path}")
